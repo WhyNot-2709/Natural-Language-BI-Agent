@@ -1,20 +1,23 @@
 import os
-from typing import TypedDict
-import chromadb
-import sqlite3
 import json
+import sqlite3
+import chromadb
+from typing import TypedDict, Literal
 from pydantic import BaseModel, Field
-from typing import Literal, TypedDict
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.types import interrupt
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph import END, START, StateGraph
-from dataset import AUDIT_DB_PATH, BUSINESS_DB_PATH, CHROMA_DB_DIR, CHECKPOINT_DB_PATH
 
+# NEW: Postgres Checkpointer Imports
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+import psycopg
+
+# UPDATED: Removed AUDIT_DB_PATH and CHECKPOINT_DB_PATH
+from dataset import BUSINESS_DB_PATH, CHROMA_DB_DIR
 
 from schemas import (
     BIInsightReport,
@@ -31,6 +34,10 @@ from schemas import (
 )
 
 load_dotenv()
+
+# NEW: Postgres Database URL
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 SCHEMA_TOP_K = int(os.environ.get("SCHEMA_TOP_K", "5"))
 GOLDEN_QUERY_TOP_K = int(os.environ.get("GOLDEN_QUERY_TOP_K", 3))
 ENTITY_TOP_K = int(os.environ.get("ENTITY_TOP_K", 10))
@@ -45,13 +52,11 @@ GROQ_FAILOVER_MODEL = os.environ.get("GROQ_FAILOVER_MODEL", "openai/gpt-oss-120b
 SQL_GEN_MAX_RETRIES = int(os.environ.get("SQL_GEN_MAX_RETRIES", "3"))
 HIGH_ROW_COUNT_THRESHOLD = int(os.environ.get("HIGH_ROW_COUNT_THRESHOLD", "500"))
 
-
 _chroma_client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
 _embedder = GoogleGenerativeAIEmbeddings(model=os.environ.get("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"))
 _gemini_flash = ChatGoogleGenerativeAI(model=GEMINI_MODEL)
 _gemini_lite = ChatGoogleGenerativeAI(model=GEMINI_LITE_MODEL)
 _groq_failover = ChatGroq(model=GROQ_FAILOVER_MODEL)
-
 
 class FailoverRunnable:
     def __init__(self, primary, failover, schema):
@@ -65,7 +70,6 @@ class FailoverRunnable:
         except Exception as primary_error:
             try:
                 # Inject the exact JSON schema rules into the prompt
-                import json
                 schema_rules = json.dumps(self._schema.model_json_schema())
                 failover_prompt = f"{prompt}\n\nRespond ONLY with valid JSON that strictly matches this exact schema structure:\n{schema_rules}"
                 
@@ -90,7 +94,6 @@ _mcp_client = MultiServerMCPClient(
     }
 )
 _mcp_tools_cache: list | None = None
-
 
 async def get_mcp_tools() -> list:
     global _mcp_tools_cache
@@ -130,7 +133,6 @@ class AgentState(TypedDict, total=False):
     raw_rows: list[dict]
     report: BIInsightReport
 
-
 INTAKE_CLASSIFIER_PROMPT = """You are classifying a business question before it becomes sql
 Question: {question}
 Classify it as one of:
@@ -145,7 +147,6 @@ async def intake_classifier(state: AgentState) -> dict:
     llm = get_structured_llm(IntakeClassification, lite=True)
     result = await llm.ainvoke(INTAKE_CLASSIFIER_PROMPT.format(question=state["question"]))
     return {"intake": result}
-
 
 async def embed_question(state: AgentState) -> dict:
     vector = await _embedder.aembed_query(state["question"])
@@ -211,16 +212,7 @@ async def metric_definition_lookup(state: AgentState) -> dict:
     }
     return {"metric_definitions": definitions}
 
-
-# --- assemble_context (fan-in) ---
-
 async def assemble_context(state: AgentState) -> dict:
-    """
-    Fan-in: the only node with in-edges from all four parallel branches
-    (schema_pruner, golden_query_retriever, entity_resolver,
-    metric_definition_lookup). Combines them into one RetrievedContext
-    for query_planner.
-    """
     context = RetrievedContext(
         relevant_tables=state["relevant_tables"],
         golden_query_examples=state["golden_query_examples"],
@@ -279,7 +271,6 @@ async def query_planner(state: AgentState) -> dict:
     )
     plan = await llm.ainvoke(prompt)
     return {"plan": plan}
-
 
 class SqlOutput(BaseModel):
     sql: str = Field(description="A single SQLite SELECT statement.")
@@ -432,14 +423,7 @@ Give a one-to-two sentence narrative takeaway. Then decide whether this data sui
 - Single number or nothing to compare: should_chart = false, explain why in confidence_note.
 - Otherwise: should_chart = true, pick mark_type (bar, line, point, or arc), and name the exact result column for x_field and y_field."""
 
-
 def _build_chart_spec(rows: list[dict], chart: ChartRecommendation) -> dict:
-    """
-    Builds the actual Vega-Lite spec deterministically — the model only
-    chose the chart shape (mark type, which columns), never touches the
-    real data or the JSON structure. That's what makes this impossible to
-    malform the way the LLM-generated version was.
-    """
     if not chart.should_chart or not rows or not chart.x_field or not chart.y_field:
         return {}
     return {
@@ -471,48 +455,49 @@ async def result_synthesizer(state: AgentState) -> dict:
     )
     return {"report": report}
 
-def _init_audit_db() -> None:
-    conn = sqlite3.connect(AUDIT_DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS query_audit_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            question TEXT,
-            sql TEXT,
-            is_valid INTEGER,
-            touches_restricted_column INTEGER,
-            estimated_row_count INTEGER,
-            approved INTEGER,
-            reviewer_note TEXT,
-            row_count_returned INTEGER,
-            logged_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
+# NEW: Postgres Init Audit DB (Replaces the SQLite initialization)
+async def init_audit_db() -> None:
+    if not DATABASE_URL:
+        return
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS query_audit_log (
+                id SERIAL PRIMARY KEY,
+                question TEXT,
+                sql TEXT,
+                is_valid BOOLEAN,
+                touches_restricted_column BOOLEAN,
+                estimated_row_count INTEGER,
+                approved BOOLEAN,
+                reviewer_note TEXT,
+                row_count_returned INTEGER,
+                logged_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
 
-_init_audit_db()
-
+# NEW: Postgres Audit Logger
 async def audit_logger(state: AgentState) -> dict:
+    if not DATABASE_URL:
+        return {}
+    
     validation = state.get("validation")
-    conn = sqlite3.connect(AUDIT_DB_PATH)
-    conn.execute(
-        "INSERT INTO query_audit_log "
-        "(question, sql, is_valid, touches_restricted_column, estimated_row_count, "
-        " approved, reviewer_note, row_count_returned, logged_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-        (
-            state["question"],
-            state.get("sql", ""),
-            int(validation.is_valid) if validation else None,
-            int(validation.touches_restricted_column) if validation else None,
-            validation.estimated_row_count if validation else None,
-            state.get("approved"),
-            state.get("reviewer_note"),
-            len(state.get("raw_rows", [])),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+        await conn.execute(
+            "INSERT INTO query_audit_log "
+            "(question, sql, is_valid, touches_restricted_column, estimated_row_count, "
+            " approved, reviewer_note, row_count_returned) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                state["question"],
+                state.get("sql", ""),  # The previous bug fix carried over!
+                validation.is_valid if validation else None,
+                validation.touches_restricted_column if validation else None,
+                validation.estimated_row_count if validation else None,
+                state.get("approved"),
+                state.get("reviewer_note"),
+                len(state.get("raw_rows", [])),
+            ),
+        )
     return {}
 
 async def handle_out_of_scope(state: AgentState) -> dict:
@@ -523,7 +508,6 @@ async def handle_out_of_scope(state: AgentState) -> dict:
     )
     return {"report": report}
 
-
 async def handle_validation_failure(state: AgentState) -> dict:
     validation = state["validation"]
     report = BIInsightReport(
@@ -533,7 +517,6 @@ async def handle_validation_failure(state: AgentState) -> dict:
     )
     return {"report": report}
 
-
 async def handle_approval_rejected(state: AgentState) -> dict:
     report = BIInsightReport(
         narrative_summary="This query was not approved for execution.",
@@ -541,8 +524,6 @@ async def handle_approval_rejected(state: AgentState) -> dict:
         confidence_note=state.get("reviewer_note"),
     )
     return {"report": report}
-
-# --- routing ---
 
 def route_after_intake(state: AgentState) -> str:
     if state["intake"].question_type == "out_of_scope":
@@ -562,10 +543,11 @@ def route_after_validation(state: AgentState) -> str:
 def route_after_approval(state: AgentState) -> str:
     return "sql_executor" if state["approved"] else "handle_approval_rejected"
 
-# --- graph assembly ---
-
+# NEW: Postgres Checkpointer Context
 def get_checkpointer_context():
-    return AsyncSqliteSaver.from_conn_string(str(CHECKPOINT_DB_PATH))
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set.")
+    return AsyncPostgresSaver.from_conn_string(DATABASE_URL)
 
 def build_graph(checkpointer):
     builder = StateGraph(AgentState)
@@ -593,10 +575,9 @@ def build_graph(checkpointer):
     builder.add_edge(START, "intake_classifier")
     builder.add_conditional_edges("intake_classifier", route_after_intake)
 
-    # fan out to 4 // branches
     for target in ("schema_pruner", "golden_query_retriever", "entity_resolver", "metric_definition_lookup"):
         builder.add_edge("embed_question", target)
-        builder.add_edge(target, "assemble_context") # fan in
+        builder.add_edge(target, "assemble_context")
 
     builder.add_edge("assemble_context", "query_planner")
     builder.add_edge("query_planner", "sql_generator")
@@ -610,4 +591,3 @@ def build_graph(checkpointer):
     builder.add_edge("audit_logger", END)
 
     return builder.compile(checkpointer=checkpointer)
-

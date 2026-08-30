@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from langgraph.types import Command
 from pydantic import BaseModel
-from graph import build_graph, get_checkpointer_context
+from graph import build_graph, get_checkpointer_context, init_audit_db
 from schemas import ApprovalDecision, BIInsightReport
 
 load_dotenv()
@@ -16,6 +16,8 @@ _app_state: dict = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     async with get_checkpointer_context() as checkpointer:
+        await checkpointer.setup()
+        await init_audit_db()
         _app_state["graph"] = build_graph(checkpointer)
         yield
     _app_state.clear()
