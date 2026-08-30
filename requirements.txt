@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+langgraph
+langgraph-checkpoint-sqlite
+langchain-google-genai
+langchain-groq
+langchain-mcp-adapters
+mcp
+chromadb
+streamlit
+pydantic
+python-dotenv
+faker
+requests
