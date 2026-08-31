@@ -1,42 +1,27 @@
 import os
 import json
 import sqlite3
-import chromadb
-from typing import TypedDict, Literal
-from pydantic import BaseModel, Field
-from dotenv import load_dotenv
+from typing import Literal, TypedDict
 
+import chromadb
+import psycopg
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_groq import ChatGroq
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.types import interrupt
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.graph import END, START, StateGraph
 
-# NEW: Postgres Checkpointer Imports
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-import psycopg
-
-# UPDATED: Removed AUDIT_DB_PATH and CHECKPOINT_DB_PATH
 from dataset import BUSINESS_DB_PATH, CHROMA_DB_DIR
-
 from schemas import (
-    BIInsightReport,
-    ColumnInfo,
-    GoldenQueryExample,
-    IntakeClassification,
-    QueryPlan,
-    RetrievedContext,
-    ValidationResult,
-    TableSchema,
-    ResolvedEntity,
-    ApprovalDecision,
-    ApprovalRequest
+    BIInsightReport, ColumnInfo, GoldenQueryExample, IntakeClassification,
+    QueryPlan, RetrievedContext, ValidationResult, TableSchema, ResolvedEntity,
+    ApprovalDecision, ApprovalRequest,
 )
 
 load_dotenv()
-
-# NEW: Postgres Database URL
-DATABASE_URL = os.environ.get("DATABASE_URL")
 
 SCHEMA_TOP_K = int(os.environ.get("SCHEMA_TOP_K", "5"))
 GOLDEN_QUERY_TOP_K = int(os.environ.get("GOLDEN_QUERY_TOP_K", 3))
@@ -46,17 +31,24 @@ GLOSSARY_TOP_K = int(os.environ.get("GLOSSARY_TOP_K", "5"))
 GLOSSARY_MAX_DISTANCE = float(os.environ.get("GLOSSARY_MAX_DISTANCE", "0.35"))
 
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_LITE_MODEL = os.environ.get("GEMINI_LITE_MODEL", "gemini-3.6-flash-lite")
+GEMINI_LITE_MODEL = os.environ.get("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
 GROQ_FAILOVER_MODEL = os.environ.get("GROQ_FAILOVER_MODEL", "openai/gpt-oss-120b")
 
 SQL_GEN_MAX_RETRIES = int(os.environ.get("SQL_GEN_MAX_RETRIES", "3"))
 HIGH_ROW_COUNT_THRESHOLD = int(os.environ.get("HIGH_ROW_COUNT_THRESHOLD", "500"))
+DATABASE_URL = os.environ["DATABASE_URL"]
+
+
+def get_checkpointer_context():
+    return AsyncPostgresSaver.from_conn_string(DATABASE_URL)
+
 
 _chroma_client = chromadb.PersistentClient(path=str(CHROMA_DB_DIR))
 _embedder = GoogleGenerativeAIEmbeddings(model=os.environ.get("GEMINI_EMBEDDING_MODEL", "models/gemini-embedding-001"))
 _gemini_flash = ChatGoogleGenerativeAI(model=GEMINI_MODEL)
 _gemini_lite = ChatGoogleGenerativeAI(model=GEMINI_LITE_MODEL)
 _groq_failover = ChatGroq(model=GROQ_FAILOVER_MODEL)
+
 
 class FailoverRunnable:
     def __init__(self, primary, failover, schema):
@@ -69,41 +61,50 @@ class FailoverRunnable:
             return await self._primary.ainvoke(prompt, **kwargs)
         except Exception as primary_error:
             try:
-                # Inject the exact JSON schema rules into the prompt
                 schema_rules = json.dumps(self._schema.model_json_schema())
                 failover_prompt = f"{prompt}\n\nRespond ONLY with valid JSON that strictly matches this exact schema structure:\n{schema_rules}"
-                
                 return await self._failover.ainvoke(failover_prompt, **kwargs)
             except Exception as failover_error:
                 raise RuntimeError(
                     f"Both Gemini and Groq failed. Gemini: {primary_error}, Groq: {failover_error}"
                 ) from failover_error
 
+
 def get_structured_llm(schema: type, lite: bool = False) -> FailoverRunnable:
     primary = (_gemini_lite if lite else _gemini_flash).with_structured_output(schema)
     failover = _groq_failover.with_structured_output(schema, method="json_mode")
     return FailoverRunnable(primary, failover, schema)
+
+
+# --- MCP: persistent session, not the default per-call stateless behavior ---
 
 _mcp_client = MultiServerMCPClient(
     {
         "business_db_catalog": {
             "command": "python",
             "args": ["mcp_server.py"],
-            "transport": "stdio"
+            "transport": "stdio",
         }
     }
 )
-_mcp_tools_cache: list | None = None
 
-async def get_mcp_tools() -> list:
-    global _mcp_tools_cache
-    if _mcp_tools_cache is None:
-        _mcp_tools_cache = await _mcp_client.get_tools()
-    return _mcp_tools_cache
+
+def get_mcp_session_context():
+    return _mcp_client.session("business_db_catalog")
+
+
+_mcp_tools: list | None = None
+
+
+def set_mcp_tools(tools: list) -> None:
+    global _mcp_tools
+    _mcp_tools = tools
+
 
 async def call_mcp_tool(tool_name: str, **kwargs):
-    tools = await get_mcp_tools()
-    tool = next((t for t in tools if t.name == tool_name), None)
+    if _mcp_tools is None:
+        raise RuntimeError("MCP tools not initialized — set_mcp_tools() must be called during app startup.")
+    tool = next((t for t in _mcp_tools if t.name == tool_name), None)
     if tool is None:
         raise RuntimeError(f"MCP tool '{tool_name}' not found among loaded tools.")
 
@@ -114,6 +115,9 @@ async def call_mcp_tool(tool_name: str, **kwargs):
     if isinstance(raw, list) and raw and isinstance(raw[0], dict) and "text" in raw[0]:
         return json.loads(raw[0]["text"])
     return raw
+
+
+# --- Core Graph Nodes ---
 
 class AgentState(TypedDict, total=False):
     question: str
@@ -132,6 +136,7 @@ class AgentState(TypedDict, total=False):
     reviewer_note: str | None
     raw_rows: list[dict]
     report: BIInsightReport
+
 
 INTAKE_CLASSIFIER_PROMPT = """You are classifying a business question before it becomes sql
 Question: {question}
@@ -455,11 +460,10 @@ async def result_synthesizer(state: AgentState) -> dict:
     )
     return {"report": report}
 
-# NEW: Postgres Init Audit DB (Replaces the SQLite initialization)
+# --- Audit DB Fixes ---
+
 async def init_audit_db() -> None:
-    if not DATABASE_URL:
-        return
-    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL, autocommit=True) as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS query_audit_log (
                 id SERIAL PRIMARY KEY,
@@ -475,30 +479,26 @@ async def init_audit_db() -> None:
             )
         """)
 
-# NEW: Postgres Audit Logger
 async def audit_logger(state: AgentState) -> dict:
-    if not DATABASE_URL:
-        return {}
-    
     validation = state.get("validation")
-    async with await psycopg.AsyncConnection.connect(DATABASE_URL) as conn:
+    async with await psycopg.AsyncConnection.connect(DATABASE_URL, autocommit=True) as conn:
         await conn.execute(
             "INSERT INTO query_audit_log "
             "(question, sql, is_valid, touches_restricted_column, estimated_row_count, "
             " approved, reviewer_note, row_count_returned) "
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
             (
-                state["question"],
-                state.get("sql", ""),  # The previous bug fix carried over!
+                state["question"], state.get("sql", ""),
                 validation.is_valid if validation else None,
                 validation.touches_restricted_column if validation else None,
                 validation.estimated_row_count if validation else None,
-                state.get("approved"),
-                state.get("reviewer_note"),
+                state.get("approved"), state.get("reviewer_note"),
                 len(state.get("raw_rows", [])),
             ),
         )
     return {}
+
+# --- Terminal Handlers ---
 
 async def handle_out_of_scope(state: AgentState) -> dict:
     report = BIInsightReport(
@@ -525,6 +525,8 @@ async def handle_approval_rejected(state: AgentState) -> dict:
     )
     return {"report": report}
 
+# --- Routing and Graph Assembly ---
+
 def route_after_intake(state: AgentState) -> str:
     if state["intake"].question_type == "out_of_scope":
         return "handle_out_of_scope"
@@ -542,12 +544,6 @@ def route_after_validation(state: AgentState) -> str:
 
 def route_after_approval(state: AgentState) -> str:
     return "sql_executor" if state["approved"] else "handle_approval_rejected"
-
-# NEW: Postgres Checkpointer Context
-def get_checkpointer_context():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL is not set.")
-    return AsyncPostgresSaver.from_conn_string(DATABASE_URL)
 
 def build_graph(checkpointer):
     builder = StateGraph(AgentState)
