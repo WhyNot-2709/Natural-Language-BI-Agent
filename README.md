@@ -19,7 +19,7 @@ The pipeline uses a LangGraph state machine exposed via a FastAPI backend, with 
 
 ## Pipeline
 
-The graph is deliberately not a straight line — it has a parallel fan-out, a bounded self-correction loop, and a conditional human-approval branch, not just sequential steps.
+The graph is deliberately not a straight line, it has a parallel fan-out, a bounded self-correction loop, and a conditional human-approval branch, not just sequential steps.
 
 ```mermaid
 flowchart TD
@@ -83,10 +83,10 @@ flowchart TD
 
 ## Known Limitations
 
-* `promotions` has no foreign key to `orders` — promo-effectiveness questions aren't answerable with the current schema.
-* `customers.is_active` is a snapshot, not a churn-event timestamp — trend questions ("is churn getting worse?") can't be answered correctly from this data, only point-in-time splits.
-* Restricted-column detection in `sql_validator` is a substring check on the generated SQL, not a real SQL parser — sufficient for this schema, not adversarially robust.
-* `human_approval_interrupt` has no auth — any caller can approve or reject a paused query. Fine for a demo, not for production.
+* `promotions` has no foreign key to `orders`, promo-effectiveness questions aren't answerable with the current schema.
+* `customers.is_active` is a snapshot, not a churn-event timestamp, trend questions ("is churn getting worse?") can't be answered correctly from this data, only point-in-time splits.
+* Restricted-column detection in `sql_validator` is a substring check on the generated SQL, not a real SQL parser, sufficient for this schema, not adversarially robust.
+* `human_approval_interrupt` has no auth, any caller can approve or reject a paused query. Fine for a demo, not for production.
 
 ## Local Development Setup
 
