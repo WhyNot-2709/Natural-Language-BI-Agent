@@ -2,9 +2,23 @@
 
 **[Live Demo (Streamlit)](https://natural-language-bi-agent-drsmuzlysznzxqcs4nweis.streamlit.app)** | **[Backend API (Render)](https://natural-language-bi-agent.onrender.com)**
 
+*(Note: Hosted on free tiers; the initial query may take ~45 seconds to wake the backend container.)*
+
 A multi-agent Text-to-SQL business intelligence pipeline that translates natural language into secure database operations, executes them against a read-only SQLite business database, tracks execution state and audit logs via PostgreSQL, and synthesizes the output into narrative summaries and Vega-Lite charts. 
 
 Built in preparation for the Conquerors Software Technologies internship.
+
+## Try It Yourself
+
+Three example questions, each demonstrating a different part of the pipeline:
+
+**1. Simple lookup:** `How many customers do we have in California?`
+Resolves "California" to the exact stored value (`CA`) via entity resolution, runs a one-table count, and renders as a headline metric (no chart, because a single number doesn't need one).
+
+**2. Multi-table aggregation, with a chart:** `What are our top 5 best-selling products by revenue?`
+Joins `order_items` to `products`, aggregates revenue, ranks, and limits to 5, then renders as an actual bar chart (the model only picks the chart type and axes; the real data gets assembled deterministically, not generated as text).
+
+**3. Human-in-the-loop approval:** `What is Priya Anand's email address?`
 
 ## System Architecture
 
@@ -60,40 +74,40 @@ flowchart TD
     audit --> END([response])
 ```
 
-* **Fan-out / fan-in:** The four retrieval nodes run in parallel off a single shared question embedding, not four separate embedding calls. `assemble_context` is the only node with in-edges from all four.
-* **Retry loop:** `sql_validator` is deterministic, not another LLM call. It re-runs `sql_generator` with the specific error as feedback, capped at `SQL_GEN_MAX_RETRIES`.
-* **HITL branch:** Only triggers on a restricted column or a high estimated row count. Everything else skips straight to execution.
+- **Fan-out / fan-in:** The four retrieval nodes run in parallel off a single shared question embedding, not four separate embedding calls. `assemble_context` is the only node with in-edges from all four.
+- **Retry loop:** `sql_validator` is deterministic, not another LLM call. It re-runs `sql_generator` with the specific error as feedback, capped at `SQL_GEN_MAX_RETRIES`.
+- **HITL branch:** Only triggers on a restricted column or a high estimated row count. Everything else skips straight to execution.
 
 ## Engineering Decisions & Optimizations
 
-* **Persistent MCP Sessions:** Replaced LangChain's default stateless tool-calling with a persistent `MultiServerMCPClient` session. This eliminates process-spawning overhead (re-importing dependencies on every tool call), preventing CPU starvation and 5-minute timeouts on Render's free tier.
-* **Postgres Connection Mode:** Moved away from Supabase's transaction-mode pooler (Port `6543`) to session mode (Port `5432`) specifically to stop prepared-statement crashes (`psycopg3` conflict). You trade connection pooling for absolute stability—fine at this scale, though it would need revisiting under high concurrent production load.
-* **LLM Failover Runtime:** Custom runnable wrapper that attempts structured JSON extraction via Gemini 3.6 Flash, automatically degrading to a Groq open-source model via JSON mode if schema parsing fails.
-* **Asynchronous Audit Logging:** Writes all query attempts, estimated row counts, and approval states to a remote Postgres audit table without blocking the main FastAPI event loop.
+- **Persistent MCP Sessions:** Replaced LangChain's default stateless tool-calling with a persistent `MultiServerMCPClient` session. This eliminates process-spawning overhead (re-importing dependencies on every tool call), preventing CPU starvation and 5-minute timeouts on Render's free tier.
+- **Postgres Connection Mode:** Moved away from Supabase's transaction-mode pooler (Port `6543`) to session mode (Port `5432`) specifically to stop prepared-statement crashes (`psycopg3` conflict). You trade connection pooling for absolute stability, fine at this scale, though it would need revisiting under high concurrent production load.
+- **LLM Failover Runtime:** Custom runnable wrapper that attempts structured JSON extraction via Gemini 3.6 Flash, automatically degrading to a Groq open-source model via JSON mode if schema parsing fails.
+- **Asynchronous Audit Logging:** Writes all query attempts, estimated row counts, and approval states to a remote Postgres audit table without blocking the main FastAPI event loop.
 
 ## Technology Stack
 
-* **Frontend:** Streamlit
-* **Backend:** FastAPI, Python 3.12, Docker
-* **Agent Framework:** LangGraph, LangChain
-* **Models:** Gemini 3.6 Flash, Gemini 3.5 Flash-Lite, Groq
-* **Vector Database:** ChromaDB (Local persistent)
-* **Relational Databases:** SQLite (Read-only business data), PostgreSQL / Supabase (State checkpoints & Audit logs)
-* **Tooling Protocol:** Model Context Protocol (MCP)
+- **Frontend:** Streamlit
+- **Backend:** FastAPI, Python 3.12, Docker
+- **Agent Framework:** LangGraph, LangChain
+- **Models:** Gemini 3.6 Flash, Gemini 3.5 Flash-Lite, Groq
+- **Vector Database:** ChromaDB (Local persistent)
+- **Relational Databases:** SQLite (Read-only business data), PostgreSQL / Supabase (State checkpoints & Audit logs)
+- **Tooling Protocol:** Model Context Protocol (MCP)
 
 ## Known Limitations
 
-* `promotions` has no foreign key to `orders`, promo-effectiveness questions aren't answerable with the current schema.
-* `customers.is_active` is a snapshot, not a churn-event timestamp, trend questions ("is churn getting worse?") can't be answered correctly from this data, only point-in-time splits.
-* Restricted-column detection in `sql_validator` is a substring check on the generated SQL, not a real SQL parser, sufficient for this schema, not adversarially robust.
-* `human_approval_interrupt` has no auth, any caller can approve or reject a paused query. Fine for a demo, not for production.
+- `promotions` has no foreign key to `orders`, promo-effectiveness questions aren't answerable with the current schema.
+- `customers.is_active` is a snapshot, not a churn-event timestamp, trend questions ("is churn getting worse?") can't be answered correctly from this data, only point-in-time splits.
+- Restricted-column detection in `sql_validator` is a substring check on the generated SQL, not a real SQL parser, sufficient for this schema, not adversarially robust.
+- `human_approval_interrupt` has no auth, any caller can approve or reject a paused query. Fine for a demo, not for production.
 
 ## Local Development Setup
 
 ### 1. Prerequisites
-* Python 3.12+
-* A Supabase Postgres project
-* API Keys for Google Gemini and Groq
+- Python 3.12+
+- A Supabase Postgres project
+- API Keys for Google Gemini and Groq
 
 ### 2. Environment Variables
 Create a `.env` file in the root directory:
@@ -125,7 +139,7 @@ In a new terminal pane, start the Streamlit frontend:
 
 ## Deployment
 
-* **Backend (Render):** Deployed as a Web Service using the Docker runtime environment. Requires the `.env` variables mapped in the Render dashboard. 
-* **Frontend (Streamlit Community Cloud):** Requires the Render backend URL added to the Streamlit Advanced Settings > Secrets block:
+- **Backend (Render):** Deployed as a Web Service using the Docker runtime environment. Requires the `.env` variables mapped in the Render dashboard. 
+- **Frontend (Streamlit Community Cloud):** Requires the Render backend URL added to the Streamlit Advanced Settings > Secrets block:
 
     API_BASE_URL = "https://natural-language-bi-agent.onrender.com"
