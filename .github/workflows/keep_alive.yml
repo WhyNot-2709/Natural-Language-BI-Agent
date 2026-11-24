@@ -1,0 +1,48 @@
+name: Keep Streamlit, Render, and Supabase Alive
+
+on:
+  schedule:
+    - cron: '0 */8 * * *'
+  workflow_dispatch:
+
+jobs:
+  wake-services:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install chromium
+
+      - name: Wake Streamlit, Render, and Supabase
+        env:
+          STREAMLIT_URL: "https://natural-language-bi-agent-drsmuzlysznzxqcs4nweis.streamlit.app"
+          RENDER_HEALTH_URL: "https://natural-language-bi-agent.onrender.com/health"
+          SUPABASE_FILE_URL: "https://daqzkqhcdrrcjgalxlxr.supabase.co/storage/v1/object/public/keepalive/keepalive.txt"
+        run: |
+          python -c "
+          import os, urllib.request
+          from playwright.sync_api import sync_playwright
+
+          urllib.request.urlopen(os.environ['SUPABASE_FILE_URL'], timeout=30)
+          print('1. Supabase pinged.')
+
+          urllib.request.urlopen(os.environ['RENDER_HEALTH_URL'], timeout=60)
+          print('2. Render woken up.')
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(os.environ['STREAMLIT_URL'], wait_until='networkidle', timeout=60000)
+              wake_btn = page.get_by_role('button', name='Yes, get this app back up!')
+              if wake_btn.is_visible():
+                  wake_btn.click()
+                  page.wait_for_timeout(15000)
+              browser.close()
+          print('3. Streamlit checked/woken.')
+          "
