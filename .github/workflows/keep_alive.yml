@@ -1,4 +1,4 @@
-name: Keep Streamlit, Render, and Supabase Alive
+name: Keep Streamlit and Supabase Alive
 
 on:
   schedule:
@@ -19,10 +19,9 @@ jobs:
           pip install playwright
           playwright install chromium
 
-      - name: Wake Streamlit, Render, and Supabase
+      - name: Wake Streamlit and Supabase
         env:
           STREAMLIT_URL: "https://natural-language-bi-agent-drsmuzlysznzxqcs4nweis.streamlit.app"
-          RENDER_HEALTH_URL: "https://natural-language-bi-agent.onrender.com/health"
           SUPABASE_FILE_URL: "https://daqzkqhcdrrcjgalxlxr.supabase.co/storage/v1/object/public/keepalive/keepalive.txt"
         run: |
           python -c "
@@ -31,9 +30,6 @@ jobs:
 
           urllib.request.urlopen(os.environ['SUPABASE_FILE_URL'], timeout=30)
           print('1. Supabase pinged.')
-
-          urllib.request.urlopen(os.environ['RENDER_HEALTH_URL'], timeout=60)
-          print('2. Render woken up.')
 
           with sync_playwright() as p:
               browser = p.chromium.launch()
@@ -44,5 +40,5 @@ jobs:
                   wake_btn.click()
                   page.wait_for_timeout(15000)
               browser.close()
-          print('3. Streamlit checked/woken.')
+          print('2. Streamlit checked/woken.')
           "
